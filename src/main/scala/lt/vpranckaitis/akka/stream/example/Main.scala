@@ -17,7 +17,7 @@ import spray.json._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.concurrent.duration._
-import scala.util.Try
+import scala.util.{Success, Try}
 
 object Main extends App {
   implicit val system = ActorSystem()
@@ -29,11 +29,15 @@ object Main extends App {
 
   val connectionPool = Http().cachedHostConnectionPool[Unit]("api.shoutcloud.io")
 
-  val toUppercase = Flow[String].mapAsync(1)(x => Marshal(Map("INPUT" -> x).toJson).to[RequestEntity] map { e =>
+  def toRequest(s: String) = Marshal(Map("INPUT" -> s).toJson).to[RequestEntity] map { e =>
     (HttpRequest(HttpMethods.POST, "/V1/SHOUT", entity = e), ())
-  }).via(connectionPool).mapAsync(1)(_._1.fold(
-    _ => Future.successful("failed"),
-    resp => Unmarshal(resp.entity).to[Map[String, String]] map { _("OUTPUT") }))
+  }
+  def parseResponse(resp: (Try[HttpResponse], Unit)) = resp match {
+    case (Success(HttpResponse(_, _, entity, _)), _) => Unmarshal(entity).to[Map[String, String]] map { _("OUTPUT") }
+    case _ => Future.successful("failed")
+  }
+
+  val toUppercase = Flow[String].mapAsync(1)(toRequest).via(connectionPool).mapAsync(1)(parseResponse)
 
   val startTime = System.currentTimeMillis()
 
@@ -41,8 +45,8 @@ object Main extends App {
     Flow.fromGraph(GraphDSL.create() { implicit b ⇒
       import GraphDSL.Implicits._
 
-      val partition = b.add(Partition[String](2, x => Try(x.toInt).fold(_ => 0, _ => 1)).async)
-      val zip = b.add(Zip[String, String]())
+      val split = b.add(Partition[String](2, x => Try(x.toInt).fold(_ => 0, _ => 1)).async)
+      val join = b.add(Zip[String, String]())
 
       val stringsFlow = Flow[String]
         .via(toUppercase)
@@ -57,19 +61,19 @@ object Main extends App {
       val buffer = Flow[String].buffer(100, OverflowStrategy.backpressure)
       val throttle = Flow[String].throttle(1, 100.millis, 0, ThrottleMode.Shaping)
 
-      partition.out(0) ~>             buffer ~> throttle ~> stringsFlow ~> zip.in0
-      partition.out(1) ~> intsFlow ~> buffer ~>                            zip.in1
+      split.out(0) ~>             buffer ~> throttle ~> stringsFlow ~> join.in0
+      split.out(1) ~> intsFlow ~> buffer ~>                            join.in1
 
-      FlowShape(partition.in, zip.out)
+      FlowShape(split.in, join.out)
     })
 
-  val input = scala.io.Source.fromFile("input.txt")
-
   val source = FileIO.fromPath(Paths.get("1.balanced.txt"))
-    .via(Framing.delimiter(ByteString('\n'), Int.MaxValue, true))
+    .via(Framing.delimiter(ByteString('\n'), Int.MaxValue, allowTruncation = true))
     .map(_.utf8String)
 
-  val future = source.via(flow).to(Sink.foreach(println)).run()
+  val sink = Sink.foreach(println)
+
+  val runFuture = source.via(flow).to(sink).run()
 
   /*scala.io.Source.fromFile("input.txt").getLines().zipWithIndex.flatMap { case (s, i) =>
     List(s, (i / 3).toString)
