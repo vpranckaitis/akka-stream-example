@@ -53,7 +53,24 @@ object Main extends App {
 
   // -----
 
-  def toUppercase = Flow.fromFunction[String, String](_.toUpperCase).async
+  def toUppercase = {
+    val connectionPool = Http().cachedHostConnectionPool[Unit]("api.shoutcloud.io")
+
+    def toRequest(s: String) = Marshal(Map("INPUT" -> s).toJson).to[RequestEntity] map { e =>
+      (HttpRequest(HttpMethods.POST, "/V1/SHOUT", entity = e), ())
+    }
+
+    def parseResponse(resp: (Try[HttpResponse], Unit)) = resp match {
+      case (Success(resp), _) => Unmarshal(resp.entity).to[Map[String, String]] map { _("OUTPUT") }
+      case _ => Future.successful("failed")
+    }
+
+    Flow[String]
+      .mapAsync(1)(toRequest)
+      .via(connectionPool)
+      .mapAsync(1)(parseResponse)
+      .async
+  }
 
   def timeDiff(x: (String, _)) = {
     val time = System.currentTimeMillis() - PreviousTime
