@@ -24,34 +24,33 @@ object Main extends App {
   implicit val materializer: Materializer = ActorMaterializer(
     ActorMaterializerSettings(system).withInputBuffer(initialSize = 1, maxSize = 1)
   )
-
-  val StartTime = System.currentTimeMillis()
+  var PreviousTime = System.currentTimeMillis()
 
   val flow = Flow.fromGraph(GraphDSL.create() { implicit b ⇒
     import GraphDSL.Implicits._
 
-    val split = b.add(Unzip[String, Int]().async)
-    val join = b.add(Zip[String, Long]())
+    val broadcast = b.add(Broadcast[String](2))
+    val join = b.add(Zip[String, Unit]())
 
-    val throttle = Flow[String].throttle(1, 1.second, 0, ThrottleMode.Shaping)
+    val throttle = Flow[String].throttle(1, 200.millis, 0, ThrottleMode.Shaping)
 
-    val buffer1 = Flow[String].buffer(100, OverflowStrategy.backpressure)
-    val buffer2 = Flow[Long].buffer(100, OverflowStrategy.backpressure)
+    val buffer1 = Flow[String].buffer(10, OverflowStrategy.backpressure)
+    val buffer2 = Flow[Unit].buffer(10, OverflowStrategy.backpressure)
 
-    split.out0 ~>                   buffer1 ~> throttle ~> toUppercase ~> join.in0
-    split.out1 ~> sleepWithTimer ~> buffer2 ~>                            join.in1
+    broadcast ~>                       buffer1 ~> throttle ~> toUppercase ~> join.in0
+    broadcast ~> sleepIfLongerThan5 ~> buffer2 ~>                            join.in1
 
-    FlowShape(split.in, join.out)
+    FlowShape(broadcast.in, join.out)
   })
 
   val source = FileIO.fromPath(Paths.get("input.txt"))
     .via(Framing.delimiter(ByteString(' '), Int.MaxValue, allowTruncation = true))
     .map(_.utf8String)
-    .map(x => (x, x.length))
 
   val sink = Sink.foreach[(String, Long)](p => println(f"${p._1}%-10s ${p._2 * 0.001}%4.1f"))
 
-  source.via(flow).to(sink).run()
+  source.via(flow).map(timeDiff).to(sink).run()
+
 
   // -----
 
@@ -74,8 +73,11 @@ object Main extends App {
       .async
   }
 
-  def sleepWithTimer = Flow.fromFunction[Int, Long](x => {
-    Thread.sleep(x * 100)
-    System.currentTimeMillis() - StartTime
-  }).async
+  def timeDiff(x: (String, _)) = {
+    val time = System.currentTimeMillis() - PreviousTime
+    PreviousTime = System.currentTimeMillis()
+    (x._1, time)
+  }
+
+  def sleepIfLongerThan5 = Flow.fromFunction[String, Unit](s => if (s.length > 5) Thread.sleep(1000)).async
 }
