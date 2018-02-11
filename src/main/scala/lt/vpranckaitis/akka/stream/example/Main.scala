@@ -32,8 +32,10 @@ object Main extends App {
     val broadcast = b.add(Broadcast[String](2))
     val join = b.add(Zip[String, Unit]())
 
-    broadcast ~> toUppercase        ~> join.in0
-    broadcast ~> sleepIfLongerThan5 ~> join.in1
+    val throttle = Flow[String].throttle(1, 200.millis, 0, ThrottleMode.Shaping)
+
+    broadcast ~> throttle           ~> toUppercase ~> join.in0
+    broadcast ~> sleepIfLongerThan5 ~>                join.in1
 
     FlowShape(broadcast.in, join.out)
   })
