@@ -34,8 +34,11 @@ object Main extends App {
 
     val throttle = Flow[String].throttle(1, 200.millis, 0, ThrottleMode.Shaping)
 
-    broadcast ~> throttle           ~> toUppercase ~> join.in0
-    broadcast ~> sleepIfLongerThan5 ~>                join.in1
+    val buffer1 = Flow[String].buffer(10, OverflowStrategy.backpressure)
+    val buffer2 = Flow[Unit].buffer(10, OverflowStrategy.backpressure)
+
+    broadcast ~>                       buffer1 ~> throttle ~> toUppercase ~> join.in0
+    broadcast ~> sleepIfLongerThan5 ~> buffer2 ~>                            join.in1
 
     FlowShape(broadcast.in, join.out)
   })
