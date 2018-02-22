@@ -10,7 +10,7 @@ import akka.http.scaladsl.model.{HttpEntity, HttpRequest, HttpResponse}
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream._
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Merge, Source, Unzip}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Merge, Source}
 import akka.util.ByteString
 import org.joda.time.{DateTime, Hours}
 import spray.json.DefaultJsonProtocol._
@@ -27,9 +27,10 @@ object GithubReplay extends App {
 
   implicit val pullRequestFormat = jsonFormat(PullRequest, "title", "state", "created_at", "merged_at")
 
-  val httpRequest: Flow[String, (List[PullRequest], Option[NextPage]), NotUsed] = {
-    val connectionPool = Http().cachedHostConnectionPoolHttps[Unit](host = "api.github.com")
+  type Response = (List[PullRequest], Option[NextPage])
 
+  val httpRequest: Flow[String, Response, NotUsed] = {
+    val connectionPool = Http().cachedHostConnectionPoolHttps[Unit](host = "api.github.com")
     val authHeader = args.headOption map { token => Authorization(GenericHttpCredentials("token", token)) }
 
     def toRequest(uri: String) = HttpRequest(uri = uri).withHeaders(authHeader.toList)
@@ -42,28 +43,27 @@ object GithubReplay extends App {
       Unmarshal(resp.entity).to[List[PullRequest]].map { (_, resp.header[Link].flatMap(getNext)) }
 
     Flow[String]
-      .map(uri => (toRequest(uri), ()))
+      .map { x => println(x); x }
+      .map { uri => (toRequest(uri), ()) }
       .via(connectionPool)
-      .mapAsync(1)(_._1.fold(Future.failed, parseResponse))
+      .mapAsync(1) { _._1.fold(Future.failed, parseResponse) }
   }
 
   val traversePages = Flow.fromGraph(GraphDSL.create() { implicit builder =>
     import GraphDSL.Implicits._
 
     val merge = builder.add(Merge[String](2))
-    val broadcast = builder.add(Broadcast[(List[PullRequest], Option[NextPage])](2, eagerCancel = true))
+    val broadcast = builder.add(Broadcast[Response](2, eagerCancel = true))
 
-    val collectUris = Flow[(Any, Option[NextPage])]
-      .collect { case (_, x) => x }
-      .takeWhile { x => x.isDefined }
-      .collect[String] { case Some(NextPage(uri)) => uri }
+    val collectUris = Flow[Response]
+      .takeWhile { x => x._2.isDefined }
+      .collect[String] { case (_, Some(NextPage(uri))) => uri }
 
-    val collectPrs = builder.add(Flow[(List[PullRequest], Any)].mapConcat { x => x._1 })
-    val log = Flow[String].map { x => println(x); x }
+    val collectPrs = builder.add(Flow[Response].mapConcat { x => x._1 })
 
-    merge ~> log ~> httpRequest ~> broadcast
-    merge <~     collectUris    <~ broadcast
-                                   broadcast ~> collectPrs
+    merge ~> httpRequest ~> broadcast
+    merge <~ collectUris <~ broadcast
+                            broadcast ~> collectPrs
 
     FlowShape(merge.in(1), collectPrs.out)
   })
@@ -85,19 +85,19 @@ object GithubReplay extends App {
         case _ => false
       }
       .fold(("", List.empty[Int])) { case ((_, hs), (m, h) +: _) => (m, h :: hs) }
+      .concatSubstreams
       .map { case (month, hours) =>
         val cnt = hours.size
         val mean = hours.sum.toDouble / cnt
         val median = hours.sortBy(identity).drop(cnt / 2).head
         val max = hours.max
-        (month, cnt, mean, median, max)
+        f"$month%s $cnt%3d $mean%6.2f $median%4d $max%4d\n"
       }
-      .concatSubstreams
 
   val route = get {
     path("users" / Segment / "repos" / Segment) { (user, repo) =>
       complete {
-        HttpEntity.Chunked.fromData(`text/plain(UTF-8)`, flow(user, repo).map { x => ByteString(x + "\n") })
+        HttpEntity.Chunked.fromData(`text/plain(UTF-8)`, flow(user, repo).map { ByteString.fromString })
       }
     }
   }
