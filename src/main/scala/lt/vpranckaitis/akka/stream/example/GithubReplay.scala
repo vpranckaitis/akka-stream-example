@@ -10,7 +10,7 @@ import akka.http.scaladsl.model.{HttpEntity, HttpRequest, HttpResponse}
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.stream._
-import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Merge, Source}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Merge, Source, Unzip}
 import akka.util.ByteString
 import org.joda.time.{DateTime, Hours}
 import spray.json.DefaultJsonProtocol._
@@ -18,17 +18,16 @@ import spray.json.DefaultJsonProtocol._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 
-sealed trait Response
-case class NextPage(uri: String) extends Response
-case class PullRequest(title: String, state: String, createdAt: String, merged_at: Option[String]) extends Response
-
 object GithubReplay extends App {
   implicit val system: ActorSystem = ActorSystem()
   implicit val mat: Materializer = ActorMaterializer()
 
+  case class NextPage(uri: String)
+  case class PullRequest(title: String, state: String, createdAt: String, merged_at: Option[String])
+
   implicit val pullRequestFormat = jsonFormat(PullRequest, "title", "state", "created_at", "merged_at")
 
-  val httpRequest: Flow[String, Response, NotUsed] = {
+  val httpRequest: Flow[String, (List[PullRequest], Option[NextPage]), NotUsed] = {
     val connectionPool = Http().cachedHostConnectionPoolHttps[Unit](host = "api.github.com")
 
     val authHeader = args.headOption map { token => Authorization(GenericHttpCredentials("token", token)) }
@@ -40,30 +39,33 @@ object GithubReplay extends App {
     }
 
     def parseResponse(resp: HttpResponse) =
-      Unmarshal(resp.entity).to[List[PullRequest]].map { prs => resp.header[Link].flatMap(getNext) ++: prs }
+      Unmarshal(resp.entity).to[List[PullRequest]].map { (_, resp.header[Link].flatMap(getNext)) }
 
     Flow[String]
       .map(uri => (toRequest(uri), ()))
       .via(connectionPool)
       .mapAsync(1)(_._1.fold(Future.failed, parseResponse))
-      .mapConcat(identity)
   }
 
   val traversePages = Flow.fromGraph(GraphDSL.create() { implicit builder =>
     import GraphDSL.Implicits._
 
     val merge = builder.add(Merge[String](2))
-    val broadcast = builder.add(Broadcast[Response](2, eagerCancel = true))
+    val broadcast = builder.add(Broadcast[(List[PullRequest], Option[NextPage])](2, eagerCancel = true))
 
-    val collectUris = Flow[Response].collect[String] { case NextPage(uri) => uri }
-    def log = Flow[String].map { x => println(x); x }
+    val collectUris = Flow[(Any, Option[NextPage])]
+      .collect { case (_, x) => x }
+      .takeWhile { x => x.isDefined }
+      .collect[String] { case Some(NextPage(uri)) => uri }
+
+    val collectPrs = builder.add(Flow[(List[PullRequest], Any)].mapConcat { x => x._1 })
+    val log = Flow[String].map { x => println(x); x }
 
     merge ~> log ~> httpRequest ~> broadcast
     merge <~     collectUris    <~ broadcast
+                                   broadcast ~> collectPrs
 
-    val output = broadcast.collect { case pr: PullRequest => pr }
-
-    FlowShape(merge.in(1), output.outlet)
+    FlowShape(merge.in(1), collectPrs.out)
   })
 
   def parseMonthAndDuration: PartialFunction[PullRequest, (String, Int)] = {
@@ -78,7 +80,7 @@ object GithubReplay extends App {
       .via(traversePages)
       .collect(parseMonthAndDuration)
       .sliding(2)
-      .splitAfter(SubstreamCancelStrategy.drain) {
+      .splitAfter(SubstreamCancelStrategy.propagate) {
         case (month1, _) +: (month2, _) +: _ => month1 != month2
         case _ => false
       }
