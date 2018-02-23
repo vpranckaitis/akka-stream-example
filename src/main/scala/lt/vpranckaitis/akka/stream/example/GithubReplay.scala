@@ -3,6 +3,7 @@ package lt.vpranckaitis.akka.stream.example
 import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
+import akka.http.scaladsl.coding.Gzip
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.model.ContentTypes.`text/plain(UTF-8)`
 import akka.http.scaladsl.model.headers._
@@ -32,15 +33,16 @@ object GithubReplay extends App {
   val httpRequest: Flow[String, Response, NotUsed] = {
     val connectionPool = Http().cachedHostConnectionPoolHttps[Unit](host = "api.github.com")
     val authHeader = args.headOption map { token => Authorization(GenericHttpCredentials("token", token)) }
+    val acceptEncoding = `Accept-Encoding`(HttpEncodingRange(HttpEncodings.gzip))
 
-    def toRequest(uri: String) = HttpRequest(uri = uri).withHeaders(authHeader.toList)
+    def toRequest(uri: String) = HttpRequest(uri = uri).withHeaders(acceptEncoding :: authHeader.toList)
 
     def getNext(linkHeader: Link): Option[NextPage] = linkHeader.values.collectFirst {
       case LinkValue(uri, params) if params.exists(_.value == "next") => NextPage(uri.toString)
     }
 
     def parseResponse(resp: HttpResponse) =
-      Unmarshal(resp.entity).to[List[PullRequest]].map { (_, resp.header[Link].flatMap(getNext)) }
+      Unmarshal(Gzip.decodeMessage(resp).entity).to[List[PullRequest]].map { (_, resp.header[Link].flatMap(getNext)) }
 
     Flow[String]
       .map { x => println(x); x }
@@ -61,9 +63,8 @@ object GithubReplay extends App {
 
     val collectPrs = builder.add(Flow[Response].mapConcat { x => x._1 })
 
-    merge ~> httpRequest ~> broadcast
+    merge ~> httpRequest ~> broadcast ~> collectPrs
     merge <~ collectUris <~ broadcast
-                            broadcast ~> collectPrs
 
     FlowShape(merge.in(1), collectPrs.out)
   })
@@ -75,24 +76,28 @@ object GithubReplay extends App {
       (createdDate.toString("YYYY-MM"), hours)
   }
 
+  def differentMonth: (Seq[(String, Any)] => Boolean) = {
+    case (month1, _) +: (month2, _) +: _ => month1 != month2
+    case _ => false
+  }
+
+  def statistics(xs: List[Int]): String = {
+    val cnt = xs.size
+    val mean = xs.sum.toDouble / cnt
+    val median = xs.sortBy(identity).drop(cnt / 2).head
+    val max = xs.max
+    f"$cnt%5d $mean%8.2f $median%5d $max%6d\n"
+  }
+
   def flow(user: String, repo: String) =
     Source.single(s"https://api.github.com/repos/$user/$repo/pulls?state=closed&sort=created&direction=asc&per_page=300")
       .via(traversePages)
       .collect(parseMonthAndDuration)
       .sliding(2)
-      .splitAfter(SubstreamCancelStrategy.propagate) {
-        case (month1, _) +: (month2, _) +: _ => month1 != month2
-        case _ => false
-      }
+      .splitAfter(SubstreamCancelStrategy.propagate) { differentMonth }
       .fold(("", List.empty[Int])) { case ((_, hs), (m, h) +: _) => (m, h :: hs) }
+      .map { case (month, hours) => month + statistics(hours) }
       .concatSubstreams
-      .map { case (month, hours) =>
-        val cnt = hours.size
-        val mean = hours.sum.toDouble / cnt
-        val median = hours.sortBy(identity).drop(cnt / 2).head
-        val max = hours.max
-        f"$month%s $cnt%3d $mean%6.2f $median%4d $max%4d\n"
-      }
 
   val route = get {
     path("users" / Segment / "repos" / Segment) { (user, repo) =>
