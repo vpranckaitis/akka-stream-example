@@ -70,12 +70,35 @@ object GithubReplay extends App {
     FlowShape(merge.in(1), collectPrs.out)
   })
 
+  def parseMonthAndDuration: PartialFunction[PullRequest, (String, Int)] = {
+    case PullRequest(_, "closed", created, Some(merged)) =>
+      val createdDate = DateTime.parse(created)
+      val hours = Hours.hoursBetween(createdDate, DateTime.parse(merged)).getHours
+      (createdDate.toString("YYYY-MM"), hours)
+  }
+
+  def differentMonth: (Seq[(String, Any)] => Boolean) = {
+    case (month1, _) +: (month2, _) +: _ => month1 != month2
+    case _ => false
+  }
+
+  def statistics(xs: List[Int]): String = {
+    val cnt = xs.size
+    val mean = xs.sum.toDouble / cnt
+    val median = xs.sortBy(identity).drop(cnt / 2).head
+    val max = xs.max
+    f"$cnt%5d $mean%8.2f $median%5d $max%6d\n"
+  }
+
   def flow(user: String, repo: String) =
     Source.single(s"https://api.github.com/repos/$user/$repo/pulls?state=closed&sort=created&direction=asc&per_page=300")
       .via(traversePages)
-      .throttle(1, 50.millis, 0, ThrottleMode.Shaping)
-      .map { _.title + "\n" }
-      //.map { s => (1 to 10).map { _ => s }.mkString }
+      .collect(parseMonthAndDuration)
+      .sliding(2)
+      .splitAfter(SubstreamCancelStrategy.propagate) { differentMonth }
+      .fold(("", List.empty[Int])) { case ((_, hs), (m, h) +: _) => (m, h :: hs) }
+      .map { case (month, hours) => month + statistics(hours) }
+      .concatSubstreams
 
   val route = get {
     path("users" / Segment / "repos" / Segment) { (user, repo) =>
